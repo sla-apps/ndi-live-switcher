@@ -20,6 +20,7 @@ Requires: NDI runtime/tools installed, plus `pip install -r requirements.txt`.
 import json
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -40,12 +41,13 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "NDI Live Switcher"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 REFRESH_MS = 1000
 THUMB_W, THUMB_H = 256, 144
 THUMB_FPS = 5
 CARD_W = THUMB_W + 20
 GRID_SPACING = 16
+MON_W, MON_H = 352, 198
 ZOOM_MIN, ZOOM_MAX = 100, 500
 PAN_RANGE = 100
 DEFAULT_FRAMING = {"zoom": 100, "x": 0, "y": 0}
@@ -79,6 +81,17 @@ QPushButton:hover { background:#3a3f48; }
 BTN_LIVE = """
 QPushButton { background:#d11a2a; color:white; border:1px solid #ff4d5a;
               border-radius:6px; padding:8px; font-weight:bold; font-size:14px; }
+"""
+BTN_CUE = """
+QPushButton { background:#1fa34a; color:white; border:1px solid #39d06b;
+              border-radius:6px; padding:8px; font-weight:bold; font-size:14px; }
+"""
+BTN_TAKE = """
+QPushButton { background:#f0a500; color:#111; border:2px solid #ffc94a;
+              border-radius:10px; font-weight:bold; font-size:26px; letter-spacing:4px; }
+QPushButton:hover { background:#ffb81c; }
+QPushButton:pressed { background:#c98a00; }
+QPushButton:disabled { background:#3a3320; color:#6c6040; border-color:#4a4128; }
 """
 BTN_SMALL = """
 QPushButton { background:transparent; color:#aab2bc; border:1px solid #3a3f48;
@@ -124,7 +137,10 @@ def draw_framed(p: QPainter, W: int, H: int, img: QImage, framing: dict):
     sw, sh = w * s, h * s
     cx = W / 2 + (framing["x"] / 100.0) * sw / 2
     cy = H / 2 + (framing["y"] / 100.0) * sh / 2
-    p.drawImage(QRectF(cx - sw / 2, cy - sh / 2, sw, sh), img)
+    if abs(s - 1.0) < 0.002:  # 1:1 pixels - no scaling work at all
+        p.drawImage(QPointF(round(cx - sw / 2), round(cy - sh / 2)), img)
+    else:
+        p.drawImage(QRectF(cx - sw / 2, cy - sh / 2, sw, sh), img)
     return sw, sh
 
 
@@ -164,8 +180,14 @@ class DiscoveryThread(QThread):
 
 
 class ReceiverThread(QThread):
-    """Connects to one named NDI source and emits video frames as QImages."""
-    frame_ready = Signal(QImage)
+    """Connects to one named NDI source and delivers video frames as QImages.
+
+    Low latency: frames that are already stale are skipped (only the newest
+    waiting frame is used) and the UI is only ever handed the latest frame,
+    so a slow screen can never build up a backlog of old pictures.
+    Consumers connect to `frame_available` and call `take()`.
+    """
+    frame_available = Signal()
     status = Signal(str)
 
     def __init__(self, source_name: str, preview: bool = False):
@@ -173,14 +195,54 @@ class ReceiverThread(QThread):
         self.source_name = source_name
         self.preview = preview
         self._running = True
+        self._lock = threading.Lock()
+        self._latest = None
+        self._waiting = False
+        self.last_image = None
+
+    # -- mailbox --
+    def _post(self, img: QImage):
+        with self._lock:
+            self._latest = img
+            if self._waiting:
+                return
+            self._waiting = True
+        self.frame_available.emit()
+
+    def take(self):
+        with self._lock:
+            img, self._latest = self._latest, None
+            self._waiting = False
+        if img is not None:
+            self.last_image = img
+        return img
 
     def _find_source(self, finder):
         while self._running:
             for s in ndi.find_get_current_sources(finder):
                 if s.ndi_name == self.source_name:
                     return s
-            ndi.find_wait_for_sources(finder, 200)
+            ndi.find_wait_for_sources(finder, 100)
         return None
+
+    def _free(self, recv, t, v, a, m):
+        if t == ndi.FRAME_TYPE_VIDEO:
+            ndi.recv_free_video_v2(recv, v)
+        elif t == ndi.FRAME_TYPE_AUDIO:
+            ndi.recv_free_audio_v2(recv, a)
+        elif t == ndi.FRAME_TYPE_METADATA:
+            ndi.recv_free_metadata(recv, m)
+
+    def _to_qimage(self, v):
+        h, w = v.yres, v.xres
+        arr = v.data
+        if not arr.flags["C_CONTIGUOUS"]:
+            arr = np.ascontiguousarray(arr)
+        img = QImage(arr.data, w, h, w * 4, QImage.Format_RGB32)
+        if self.preview:
+            return img.scaled(THUMB_W * 2, THUMB_H * 2, Qt.KeepAspectRatio,
+                              Qt.SmoothTransformation)
+        return img.copy()  # single copy out of the NDI buffer
 
     def run(self):
         self.status.emit("Connecting…")
@@ -197,6 +259,10 @@ class ReceiverThread(QThread):
         desc.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
         desc.bandwidth = (ndi.RECV_BANDWIDTH_LOWEST if self.preview
                           else ndi.RECV_BANDWIDTH_HIGHEST)
+        try:
+            desc.allow_video_fields = False
+        except AttributeError:
+            pass
         recv = ndi.recv_create_v3(desc)
         if recv is None:
             ndi.find_destroy(finder)
@@ -210,29 +276,29 @@ class ReceiverThread(QThread):
 
         try:
             while self._running:
-                t, v, a, m = ndi.recv_capture_v2(recv, 200)
-                if t == ndi.FRAME_TYPE_VIDEO:
-                    now = time.monotonic()
-                    if now - last_emit < min_gap:
+                t, v, a, m = ndi.recv_capture_v2(recv, 100)
+                if t != ndi.FRAME_TYPE_VIDEO:
+                    self._free(recv, t, v, a, m)
+                    continue
+                # Drain anything already queued so we always show the newest frame
+                while True:
+                    t2, v2, a2, m2 = ndi.recv_capture_v2(recv, 0)
+                    if t2 == ndi.FRAME_TYPE_VIDEO:
                         ndi.recv_free_video_v2(recv, v)
-                        continue
-                    last_emit = now
-                    h, w = v.yres, v.xres
-                    stride = v.line_stride_in_bytes
-                    data = np.copy(v.data)
-                    ndi.recv_free_video_v2(recv, v)
-                    img = QImage(data.data, w, h, stride, QImage.Format_RGB32)
-                    if self.preview:
-                        img = img.scaled(THUMB_W * 2, THUMB_H * 2, Qt.KeepAspectRatio,
-                                         Qt.SmoothTransformation)
+                        v = v2
+                    elif t2 in (ndi.FRAME_TYPE_AUDIO, ndi.FRAME_TYPE_METADATA):
+                        self._free(recv, t2, v2, a2, m2)
                     else:
-                        img = img.copy()
-                    if self._running:
-                        self.frame_ready.emit(img)
-                elif t == ndi.FRAME_TYPE_AUDIO:
-                    ndi.recv_free_audio_v2(recv, a)
-                elif t == ndi.FRAME_TYPE_METADATA:
-                    ndi.recv_free_metadata(recv, m)
+                        break
+                now = time.monotonic()
+                if now - last_emit < min_gap:
+                    ndi.recv_free_video_v2(recv, v)
+                    continue
+                last_emit = now
+                img = self._to_qimage(v)
+                ndi.recv_free_video_v2(recv, v)
+                if self._running:
+                    self._post(img)
         finally:
             ndi.recv_destroy(recv)
 
@@ -246,7 +312,7 @@ def retire_thread(thread, graveyard: set):
     """Stop a worker thread without blocking the UI; keep a ref until done."""
     if thread is None:
         return
-    for name in ("frame_ready", "status", "sources_changed"):
+    for name in ("frame_available", "status", "sources_changed"):
         sig = getattr(thread, name, None)
         if sig is not None:
             try:
@@ -534,7 +600,8 @@ class EditDialog(QDialog):
         self._set_all(clean_framing(framing), emit=False)
 
         self.receiver = ReceiverThread(ndi_name)
-        self.receiver.frame_ready.connect(self.view.set_image)
+        self.receiver.frame_available.connect(
+            lambda r=self.receiver: (img := r.take()) is not None and self.view.set_image(img))
         self.receiver.status.connect(self.view.set_message)
         self.receiver.start()
 
@@ -653,6 +720,13 @@ class NetworkDialog(QDialog):
 # --------------------------------------------------------------------------- #
 # Cards
 # --------------------------------------------------------------------------- #
+def no_focus(*widgets):
+    """Buttons must not grab keyboard focus, or Space would click them
+    instead of triggering TAKE."""
+    for w in widgets:
+        w.setFocusPolicy(Qt.NoFocus)
+
+
 class BaseCard(QFrame):
     def __init__(self, title: str, subtitle: str, tooltip: str):
         super().__init__()
@@ -670,33 +744,46 @@ class BaseCard(QFrame):
         s.setWordWrap(True)
         self.setToolTip(tooltip)
 
-        self.button = QPushButton("LIVE")
-        self.button.setCursor(Qt.PointingHandCursor)
-        self.buttons = QHBoxLayout()
-        self.buttons.addWidget(self.button, 1)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        names.addWidget(t)
+        names.addWidget(s)
+        self.title_row = QHBoxLayout()
+        self.title_row.addLayout(names, 1)
+
+        self.live_btn = QPushButton("LIVE")
+        self.cue_btn = QPushButton("CUE")
+        for b in (self.live_btn, self.cue_btn):
+            b.setCursor(Qt.PointingHandCursor)
+        no_focus(self.live_btn, self.cue_btn)
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.cue_btn, 1)
+        buttons.addWidget(self.live_btn, 1)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
         lay.addWidget(self.thumb)
-        lay.addWidget(t)
-        lay.addWidget(s)
-        lay.addLayout(self.buttons)
-        self.set_live(False)
+        lay.addLayout(self.title_row)
+        lay.addLayout(buttons)
+        self.set_state(False, False)
 
     def small_button(self, text, tip, fn):
         b = QPushButton(text)
         b.setToolTip(tip)
         b.setCursor(Qt.PointingHandCursor)
-        b.setStyleSheet(BTN_SMALL)
+        b.setStyleSheet(BTN_SMALL.replace("padding:8px 8px", "padding:3px 6px"))
         b.clicked.connect(fn)
-        self.buttons.addWidget(b)
+        no_focus(b)
+        self.title_row.addWidget(b, 0, Qt.AlignTop)
         return b
 
-    def set_live(self, live: bool):
-        self.button.setStyleSheet(BTN_LIVE if live else BTN_IDLE)
-        self.button.setText("● LIVE" if live else "LIVE")
-        colour = "#d11a2a" if live else self.border_colour()
+    def set_state(self, live: bool, cued: bool):
+        self.live_btn.setStyleSheet(BTN_LIVE if live else BTN_IDLE)
+        self.live_btn.setText("● LIVE" if live else "LIVE")
+        self.cue_btn.setStyleSheet(BTN_CUE if cued else BTN_IDLE)
+        self.cue_btn.setText("● CUE" if cued else "CUE")
+        colour = "#d11a2a" if live else ("#1fa34a" if cued else self.border_colour())
         self.setStyleSheet(f"QFrame#card {{ background:#1c1f24; border:2px solid {colour};"
                            " border-radius:10px; }")
 
@@ -706,6 +793,7 @@ class BaseCard(QFrame):
 
 class SourceCard(BaseCard):
     live_clicked = Signal(str)
+    cue_clicked = Signal(str)
     edit_clicked = Signal(str)
     hide_clicked = Signal(str)
 
@@ -716,19 +804,26 @@ class SourceCard(BaseCard):
         self.graveyard = graveyard
         self.preview = None
         self.thumb.set_framing(framing)
-        self.button.clicked.connect(lambda: self.live_clicked.emit(self.ndi_name))
+        self.live_btn.clicked.connect(lambda: self.live_clicked.emit(self.ndi_name))
+        self.cue_btn.clicked.connect(lambda: self.cue_clicked.emit(self.ndi_name))
         self.small_button("Edit", "Zoom and position this input",
                           lambda: self.edit_clicked.emit(self.ndi_name))
         self.small_button("Hide", "Hide this input (restore from View ▸ Hidden Inputs)",
                           lambda: self.hide_clicked.emit(self.ndi_name))
         self.set_thumbnails(show_thumb)
 
+    def _on_preview(self):
+        if self.preview is not None:
+            img = self.preview.take()
+            if img is not None:
+                self.thumb.set_image(img)
+
     def set_thumbnails(self, on: bool):
         self.thumb.setVisible(on)
         if on and self.preview is None:
             self.thumb.set_message("Connecting…")
             self.preview = ReceiverThread(self.ndi_name, preview=True)
-            self.preview.frame_ready.connect(self.thumb.set_image)
+            self.preview.frame_available.connect(self._on_preview)
             self.preview.status.connect(self.thumb.set_message)
             self.preview.start()
         elif not on and self.preview is not None:
@@ -746,6 +841,7 @@ class SourceCard(BaseCard):
 
 class ImageCard(BaseCard):
     live_clicked = Signal(str)
+    cue_clicked = Signal(str)
     remove_clicked = Signal(str)
 
     def __init__(self, path: str, image: QImage, show_thumb: bool):
@@ -753,7 +849,8 @@ class ImageCard(BaseCard):
         self.path = path
         self.thumb.set_image(image)
         self.thumb.setVisible(show_thumb)
-        self.button.clicked.connect(lambda: self.live_clicked.emit(self.path))
+        self.live_btn.clicked.connect(lambda: self.live_clicked.emit(self.path))
+        self.cue_btn.clicked.connect(lambda: self.cue_clicked.emit(self.path))
         self.small_button("Remove", "Remove this holding image from the app",
                           lambda: self.remove_clicked.emit(self.path))
 
@@ -768,13 +865,34 @@ class ImageCard(BaseCard):
 
 
 # --------------------------------------------------------------------------- #
+# Side panel monitors
+# --------------------------------------------------------------------------- #
+class MonitorView(FramedView):
+    """Small monitor that holds its last picture rather than flashing a message."""
+
+    def __init__(self):
+        super().__init__(font_size=12)
+        self.setFixedSize(QSize(MON_W, MON_H))
+
+    def set_message(self, text: str):
+        if text and not valid(self._image):
+            self._message = text
+            self.update()
+
+    def show_text(self, text: str):
+        self._image = None
+        self._message = text
+        self.update()
+
+
+# --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1200, 780)
+        self.resize(1400, 820)
         self.setStyleSheet(DARK_STYLE)
 
         st = self.settings = QSettings(APP_NAME, APP_NAME)
@@ -798,7 +916,9 @@ class MainWindow(QMainWindow):
         self.editors: dict[str, EditDialog] = {}
         self._graveyard: set = set()
         self.live = None             # ("ndi", name) | ("img", path) | None
-        self.receiver = None
+        self.cue = None
+        self.prog_rcv = None         # receiver feeding the output
+        self.cue_rcv = None          # receiver pre-rolling the cued input
 
         self.output = OutputWindow()
         self.output.fade_ms = fade_ms
@@ -808,8 +928,12 @@ class MainWindow(QMainWindow):
 
         root = QWidget(objectName="root")
         self.setCentralWidget(root)
-        outer = QVBoxLayout(root)
+        main = QHBoxLayout(root)
+        left = QVBoxLayout()
+        main.addLayout(left, 1)
+        main.addWidget(self._build_side_panel())
 
+        # ---- top bar ----
         bar = QHBoxLayout()
         title = QLabel("NDI Sources")
         title.setStyleSheet("font-size:22px; font-weight:bold;")
@@ -829,12 +953,13 @@ class MainWindow(QMainWindow):
         self.hidden_btn.setMenu(self.hidden_menu)
 
         self.screen_combo = QComboBox()
-        self.screen_combo.setMinimumWidth(240)
+        self.screen_combo.setMinimumWidth(220)
         self._populate_screens(prefer=self.saved_screen)
         self.screen_combo.currentIndexChanged.connect(self._save_screen)
         app = QGuiApplication.instance()
         app.screenAdded.connect(lambda _: self._populate_screens())
         app.screenRemoved.connect(lambda _: self._populate_screens())
+        no_focus(add_img, refresh, self.hidden_btn, self.screen_combo)
 
         bar.addWidget(title)
         bar.addSpacing(12)
@@ -844,10 +969,11 @@ class MainWindow(QMainWindow):
         bar.addWidget(refresh)
         bar.addWidget(self.hidden_btn)
         bar.addSpacing(12)
-        bar.addWidget(QLabel("Output display:"))
+        bar.addWidget(QLabel("Output:"))
         bar.addWidget(self.screen_combo)
-        outer.addLayout(bar)
+        left.addLayout(bar)
 
+        # ---- scrolling grid ----
         self.grid_host = QWidget()
         self.grid_host.setStyleSheet("background:#121417;")
         self.grid = QGridLayout(self.grid_host)
@@ -856,25 +982,113 @@ class MainWindow(QMainWindow):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(self.grid_host)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll.setStyleSheet("QScrollArea { border:none; }")
-        outer.addWidget(self.scroll)
+        self.scroll.setFocusPolicy(Qt.NoFocus)
+        left.addWidget(self.scroll, 1)
 
         for path in st.value("holding_images", [], type=list) or []:
             self._add_holding_image_path(str(path), save=False, warn=False)
         self._update_hidden_button()
+        self._update_panel()
 
         self.discovery = None
         self._start_discovery()
+
+    # ---- side panel ----
+    def _build_side_panel(self):
+        panel = QFrame()
+        panel.setObjectName("panel")
+        panel.setFixedWidth(MON_W + 28)
+        panel.setStyleSheet("QFrame#panel { background:#181b20; border-left:1px solid #2a2e35; }")
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(6)
+
+        def heading(text, colour):
+            h = QLabel(text)
+            h.setStyleSheet(f"color:{colour}; font-size:13px; font-weight:bold;"
+                            " letter-spacing:2px;")
+            return h
+
+        def name_label():
+            n = QLabel("—")
+            n.setStyleSheet("color:#e6e6e6; font-size:13px;")
+            n.setWordWrap(True)
+            return n
+
+        self.prog_mon = MonitorView()
+        self.prog_name = name_label()
+        self.cue_mon = MonitorView()
+        self.cue_name = name_label()
+
+        self.take_btn = QPushButton("TAKE")
+        self.take_btn.setToolTip("Swap the live and cued inputs (Space)")
+        self.take_btn.setMinimumHeight(70)
+        self.take_btn.setCursor(Qt.PointingHandCursor)
+        self.take_btn.setStyleSheet(BTN_TAKE)
+        self.take_btn.clicked.connect(self.take)
+
+        self.trans_combo = QComboBox()
+        for label, ms in TRANSITIONS:
+            self.trans_combo.addItem(label, ms)
+        self.trans_combo.setCurrentIndex(
+            next((i for i, (_, ms) in enumerate(TRANSITIONS) if ms == self.output.fade_ms), 0))
+        self.trans_combo.currentIndexChanged.connect(
+            lambda i: self._set_transition(self.trans_combo.itemData(i)))
+        no_focus(self.take_btn, self.trans_combo)
+
+        trans_row = QHBoxLayout()
+        trans_row.addWidget(QLabel("Transition:"))
+        trans_row.addWidget(self.trans_combo, 1)
+
+        lay.addWidget(heading("● LIVE", "#ff4d5a"))
+        lay.addWidget(self.prog_mon)
+        lay.addWidget(self.prog_name)
+        lay.addSpacing(10)
+        lay.addWidget(self.take_btn)
+        lay.addLayout(trans_row)
+        hint = QLabel("Space = TAKE")
+        hint.setStyleSheet("color:#6c747e; font-size:11px;")
+        hint.setAlignment(Qt.AlignCenter)
+        lay.addWidget(hint)
+        lay.addSpacing(10)
+        lay.addWidget(heading("● CUED", "#2ecc71"))
+        lay.addWidget(self.cue_mon)
+        lay.addWidget(self.cue_name)
+        lay.addStretch()
+        return panel
+
+    def _label_for(self, key):
+        if not key:
+            return "—"
+        return os.path.basename(key[1]) + "  (holding image)" if key[0] == "img" else key[1]
+
+    def _update_panel(self):
+        self.prog_name.setText(self._label_for(self.live))
+        self.cue_name.setText(self._label_for(self.cue))
+        if self.live is None:
+            self.prog_mon.show_text("Off air")
+        if self.cue is None:
+            self.cue_mon.show_text("Nothing cued — click CUE on an input")
+        self.take_btn.setEnabled(self.cue is not None)
+        for key, card in [(("ndi", n), c) for n, c in self.cards.items()] + \
+                         [(("img", p), c) for p, c in self.image_cards.items()]:
+            card.set_state(key == self.live, key == self.cue)
 
     # ---- helpers ----
     @property
     def live_ndi(self):
         return self.live[1] if self.live and self.live[0] == "ndi" else None
 
-    def _card_for(self, key):
-        if not key:
-            return None
-        return (self.cards if key[0] == "ndi" else self.image_cards).get(key[1])
+    @property
+    def cue_ndi(self):
+        return self.cue[1] if self.cue and self.cue[0] == "ndi" else None
+
+    def _framing_for(self, key):
+        if key and key[0] == "ndi":
+            return self.framing.get(key[1], DEFAULT_FRAMING)
+        return DEFAULT_FRAMING
 
     # ---- menus ----
     def _build_menus(self):
@@ -914,13 +1128,17 @@ class MainWindow(QMainWindow):
         act(view_m, "NDI &Network Settings…", self._network_settings)
 
         out_m = mb.addMenu("&Output")
+        self.take_action = act(out_m, "&Take (swap live and cued)", self.take, "Space")
+        self.take_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.clear_cue_action = act(out_m, "&Clear Cue", self._clear_cue)
+        out_m.addSeparator()
         self.hold_action = act(out_m, "Go to &Holding Image", self._go_holding, "Ctrl+H")
         self.edit_live_action = act(out_m, "&Edit Framing of Live Input…",
                                     lambda: self.live_ndi and self._open_editor(self.live_ndi),
                                     "Ctrl+E")
         self.off_air_action = act(out_m, "Take &Off Air", self._off_air_and_close, "Ctrl+B")
         out_m.addSeparator()
-        trans_m = out_m.addMenu("&Transition")
+        trans_m = out_m.addMenu("T&ransition")
         group = QActionGroup(self)
         for label, ms in TRANSITIONS:
             a = QAction(label, self, checkable=True)
@@ -930,31 +1148,39 @@ class MainWindow(QMainWindow):
             trans_m.addAction(a)
         self.transition_actions = group
         out_m.aboutToShow.connect(self._update_output_menu)
-        self._update_output_menu()
 
         help_m = mb.addMenu("&Help")
         a = act(help_m, f"&About {APP_NAME}", self._about)
         a.setMenuRole(QAction.AboutRole)
 
     def _update_output_menu(self):
+        self.take_action.setEnabled(self.cue is not None)
+        self.clear_cue_action.setEnabled(self.cue is not None)
         self.edit_live_action.setEnabled(self.live_ndi is not None)
         self.off_air_action.setEnabled(self.live is not None)
         self.hold_action.setEnabled(bool(self.holding))
 
-    def _set_transition(self, ms: int):
+    def _set_transition(self, ms):
+        ms = int(ms)
         self.output.fade_ms = ms
         self.settings.setValue("transition_ms", ms)
         for a in self.transition_actions.actions():
             a.setChecked(dict(TRANSITIONS).get(a.text()) == ms)
+        if hasattr(self, "trans_combo"):
+            i = self.trans_combo.findData(ms)
+            if i >= 0 and i != self.trans_combo.currentIndex():
+                self.trans_combo.blockSignals(True)
+                self.trans_combo.setCurrentIndex(i)
+                self.trans_combo.blockSignals(False)
 
     def _about(self):
         QMessageBox.about(self, APP_NAME,
                           f"<b>{APP_NAME}</b> v{APP_VERSION}<br><br>"
-                          "Click LIVE to send an NDI source or holding image full screen "
-                          "to the output display.<br><br>"
-                          "Shortcuts: Ctrl+H holding image · Ctrl+B off air · Ctrl+E edit "
-                          "live framing · Ctrl+T thumbnails · Ctrl+I add holding image · "
-                          "F5 refresh · Esc on output closes it · Ctrl+Q quit.")
+                          "CUE an input to preview it, then press TAKE (Space) to swap it with "
+                          "the live input. LIVE sends an input straight to air.<br><br>"
+                          "Shortcuts: Space take · Ctrl+H holding image · Ctrl+B off air · "
+                          "Ctrl+E edit live framing · Ctrl+T thumbnails · Ctrl+I add holding "
+                          "image · F5 refresh · Esc on output closes it · Ctrl+Q quit.")
 
     # ---- screens ----
     def _populate_screens(self, prefer: str = ""):
@@ -990,7 +1216,6 @@ class MainWindow(QMainWindow):
         self.discovery.start()
 
     def _restart_discovery(self):
-        """Search again (e.g. after changing network settings)."""
         retire_thread(self.discovery, self._graveyard)
         for card in self.cards.values():
             card.shutdown()
@@ -1018,8 +1243,9 @@ class MainWindow(QMainWindow):
 
     def _sync_cards(self):
         wanted = {n for n in self.online if n not in self.hidden}
-        if self.live_ndi:
-            wanted.add(self.live_ndi)
+        for keep in (self.live_ndi, self.cue_ndi):
+            if keep:
+                wanted.add(keep)
         for n in list(self.cards):
             if n not in wanted:
                 card = self.cards.pop(n)
@@ -1031,11 +1257,12 @@ class MainWindow(QMainWindow):
                 card = SourceCard(n, self.show_thumbs, self.framing.get(n, DEFAULT_FRAMING),
                                   self._graveyard)
                 card.live_clicked.connect(lambda name: self._on_live_clicked(("ndi", name)))
+                card.cue_clicked.connect(lambda name: self._on_cue_clicked(("ndi", name)))
                 card.edit_clicked.connect(self._open_editor)
                 card.hide_clicked.connect(self._hide_source)
-                card.set_live(self.live == ("ndi", n))
                 self.cards[n] = card
         self._relayout()
+        self._update_panel()
 
         shown = len(self.cards)
         hidden_online = sum(1 for n in self.online if n in self.hidden)
@@ -1060,6 +1287,10 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        self._relayout()
+
+    def showEvent(self, e):
+        super().showEvent(e)
         self._relayout()
 
     # ---- thumbnails ----
@@ -1089,9 +1320,11 @@ class MainWindow(QMainWindow):
         self.holding.append(path)
         card = ImageCard(path, img, self.show_thumbs)
         card.live_clicked.connect(lambda p: self._on_live_clicked(("img", p)))
+        card.cue_clicked.connect(lambda p: self._on_cue_clicked(("img", p)))
         card.remove_clicked.connect(self._remove_holding_image)
         self.image_cards[path] = card
         self._relayout()
+        self._update_panel()
         if save:
             self._save_holding()
         return True
@@ -1099,6 +1332,8 @@ class MainWindow(QMainWindow):
     def _remove_holding_image(self, path: str):
         if self.live == ("img", path):
             self._off_air_and_close()
+        if self.cue == ("img", path):
+            self._clear_cue()
         card = self.image_cards.pop(path, None)
         if card:
             self.grid.removeWidget(card)
@@ -1120,6 +1355,8 @@ class MainWindow(QMainWindow):
     def _hide_source(self, name: str):
         if self.live == ("ndi", name):
             self._off_air_and_close()
+        if self.cue == ("ndi", name):
+            self._clear_cue()
         self.hidden.add(name)
         self._save_hidden()
         self._sync_cards()
@@ -1178,6 +1415,9 @@ class MainWindow(QMainWindow):
             self.cards[name].set_framing(f)
         if self.live == ("ndi", name):
             self.output.set_live_framing(f)
+            self.prog_mon.set_framing(f)
+        if self.cue == ("ndi", name):
+            self.cue_mon.set_framing(f)
         self.settings.setValue("framing", json.dumps(self.framing))
 
     def _reset_all_framing(self):
@@ -1258,6 +1498,8 @@ class MainWindow(QMainWindow):
 
         if self.live_ndi in self.hidden:
             self._off_air_and_close()
+        if self.cue_ndi in self.hidden:
+            self._clear_cue()
 
         screen = data.get("output_screen")
         if screen:
@@ -1281,10 +1523,104 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, "These holding images could not be found:\n"
                                 + "\n".join(missing))
 
-    # ---- live switching ----
+    # ---- receivers ----
+    def _new_receiver(self, name: str):
+        rcv = ReceiverThread(name)
+        rcv.frame_available.connect(lambda r=rcv: self._on_frame(r))
+        rcv.status.connect(lambda t, r=rcv: self._on_status(r, t))
+        rcv.start()
+        return rcv
+
+    def _on_frame(self, rcv):
+        img = rcv.take()
+        if img is None:
+            return
+        if rcv is self.prog_rcv:
+            self.output.set_image(img)
+            self.prog_mon.set_image(img)
+        elif rcv is self.cue_rcv:
+            self.cue_mon.set_image(img)
+
+    def _on_status(self, rcv, text):
+        if rcv is self.prog_rcv:
+            self.output.set_message(text)
+            self.prog_mon.set_message(text)
+        elif rcv is self.cue_rcv:
+            self.cue_mon.set_message(text)
+
+    def _ensure_output(self):
+        if not self.output.isVisible():
+            self.output.reset()
+            self.output.show_on_screen(self._selected_screen())
+
+    # ---- cue ----
+    def _on_cue_clicked(self, key):
+        if key == self.cue:
+            self._clear_cue()
+        elif key == self.live:
+            self.statusBar().showMessage("That input is already live.", 3000)
+        else:
+            self._set_cue(key)
+
+    def _set_cue(self, key):
+        retire_thread(self.cue_rcv, self._graveyard)
+        self.cue_rcv = None
+        self.cue = key
+        self.cue_mon.set_framing(self._framing_for(key))
+        if key[0] == "img":
+            self.cue_mon.set_image(self.images[key[1]])
+        else:
+            self.cue_mon.show_text("Connecting…")
+            self.cue_rcv = self._new_receiver(key[1])
+        self._update_panel()
+
+    def _clear_cue(self):
+        retire_thread(self.cue_rcv, self._graveyard)
+        self.cue_rcv = None
+        self.cue = None
+        self._update_panel()
+        self._sync_cards()
+
+    # ---- take ----
+    def take(self):
+        """Swap the live and cued inputs. The cued input is already connected,
+        so the switch is instant."""
+        if self.cue is None:
+            return
+        new_live, new_cue = self.cue, self.live
+        new_img = self.cue_mon._image if valid(self.cue_mon._image) else None
+        if new_live[0] == "img":
+            new_img = self.images.get(new_live[1])
+        old_prog_img = self.prog_mon._image if valid(self.prog_mon._image) else None
+
+        self.live, self.cue = new_live, new_cue
+        self.prog_rcv, self.cue_rcv = self.cue_rcv, self.prog_rcv
+
+        self._ensure_output()
+        self.output.prepare_switch(self._framing_for(self.live), self._label_for(self.live))
+        if new_img is not None:
+            self.output.set_image(new_img)
+        else:
+            self.output.set_message("Connecting…")
+
+        self.prog_mon.set_framing(self._framing_for(self.live))
+        if new_img is not None:
+            self.prog_mon.set_image(new_img)
+        else:
+            self.prog_mon.show_text("Connecting…")
+
+        if self.cue is not None:
+            self.cue_mon.set_framing(self._framing_for(self.cue))
+            if old_prog_img is not None:
+                self.cue_mon.set_image(old_prog_img)
+        self._update_panel()
+
+    # ---- live ----
     def _on_live_clicked(self, key):
         if key == self.live:
             self._off_air_and_close()
+        elif key == self.cue:
+            self.take()
         else:
             self._go_live(key)
 
@@ -1292,59 +1628,43 @@ class MainWindow(QMainWindow):
         kind, ident = key
         if kind == "img" and ident not in self.images:
             return
-        self._stop_receiver()
-        old_card = self._card_for(self.live)
-        if old_card:
-            old_card.set_live(False)
+        if key == self.cue:
+            return self.take()
+        retire_thread(self.prog_rcv, self._graveyard)
+        self.prog_rcv = None
         self.live = key
-        card = self._card_for(key)
-        if card:
-            card.set_live(True)
-
-        if not self.output.isVisible():
-            self.output.reset()
-            self.output.show_on_screen(self._selected_screen())
-
+        self._ensure_output()
+        framing = self._framing_for(key)
+        self.output.prepare_switch(framing, self._label_for(key))
+        self.prog_mon.set_framing(framing)
         if kind == "img":
-            self.output.prepare_switch(DEFAULT_FRAMING, os.path.basename(ident))
             self.output.set_image(self.images[ident])
+            self.prog_mon.set_image(self.images[ident])
         else:
-            self.output.prepare_switch(self.framing.get(ident, DEFAULT_FRAMING), ident)
             self.output.set_message("Connecting…")
-            rcv = ReceiverThread(ident)
-            rcv.frame_ready.connect(lambda img, r=rcv: self._on_live_frame(r, img))
-            rcv.status.connect(lambda t, r=rcv: r is self.receiver and self.output.set_message(t))
-            self.receiver = rcv
-            rcv.start()
-
-    def _on_live_frame(self, rcv, img):
-        if rcv is self.receiver:  # ignore late frames from a previous input
-            self.output.set_image(img)
+            self.prog_rcv = self._new_receiver(ident)
+        self._update_panel()
 
     def _off_air_and_close(self):
         self._take_off_air()
         self.output.close()
 
     def _take_off_air(self):
-        self._stop_receiver()
+        retire_thread(self.prog_rcv, self._graveyard)
+        self.prog_rcv = None
         was = self.live
         self.live = None
-        card = self._card_for(was)
-        if card:
-            card.set_live(False)
         self.output.reset()
+        self._update_panel()
         if was and was[0] == "ndi" and (was[1] in self.hidden or was[1] not in self.online):
             self._sync_cards()
-
-    def _stop_receiver(self):
-        if self.receiver is not None:
-            retire_thread(self.receiver, self._graveyard)
-            self.receiver = None
 
     def closeEvent(self, e):
         for dlg in list(self.editors.values()):
             dlg.close()
-        self._stop_receiver()
+        retire_thread(self.prog_rcv, self._graveyard)
+        retire_thread(self.cue_rcv, self._graveyard)
+        self.prog_rcv = self.cue_rcv = None
         self.output.close()
         for card in self.cards.values():
             card.shutdown()

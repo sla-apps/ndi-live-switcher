@@ -32,19 +32,22 @@ print("FindCreate settings OK")
 stop = threading.Event()
 
 
+colours = {}
+
+
 def sender(label, colour):
+    colours[label] = colour
     sc = ndi.SendCreate()
     sc.ndi_name = label
     s = ndi.send_create(sc)
     frame = ndi.VideoFrameV2()
-    img = np.zeros((720, 1280, 4), dtype=np.uint8)
-    img[:, :, :3] = colour
+    img = np.zeros((1080, 1920, 4), dtype=np.uint8)
     img[:, :, 3] = 255
-    frame.data = img
     frame.FourCC = ndi.FOURCC_VIDEO_TYPE_BGRX
     while not stop.is_set():
-        ndi.send_send_video_v2(s, frame)
-        time.sleep(1 / 30)
+        img[:, :, :3] = colours[label]
+        frame.data = img
+        ndi.send_send_video_v2(s, frame)  # clocked by NDI at the frame rate
     ndi.send_destroy(s)
 
 
@@ -78,8 +81,7 @@ def step1():
 
 def step2():
     results["live A on output"] = ndi_live.valid(win.output._image)
-    results["live button red"] = "LIVE" in win.cards[names["A"]].button.text() and \
-        win.cards[names["A"]].button.text().startswith("●")
+    results["live button red"] = win.cards[names["A"]].live_btn.text().startswith("●")
     before = win.output._image
     win._go_live(("ndi", names["B"]))
     # Immediately after switching, the old picture must still be on screen (no black gap)
@@ -114,6 +116,64 @@ def step5():
         dlg._set_all({"zoom": 200, "x": 10, "y": -10})
         results["framing saved"] = win.framing.get(names["A"]) == {"zoom": 200, "x": 10, "y": -10}
         dlg.close()
+    # ---- cue / take ----
+    win._go_live(("ndi", names["A"]))
+    win._on_cue_clicked(("ndi", names["B"]))
+    QTimer.singleShot(3000, step6)
+
+
+def centre(img):
+    return QColor(img.pixel(img.width() // 2, img.height() // 2)) if ndi_live.valid(img) else None
+
+
+def step6():
+    results["cue button green"] = win.cards[names["B"]].cue_btn.text().startswith("●")
+    px = centre(win.cue_mon._image)
+    results["cued B shows in preview"] = px is not None and px.green() > 200
+    results["Space is the TAKE shortcut"] = win.take_action.shortcut().toString() == "Space"
+    win.take()
+    px = centre(win.output._image)
+    results["TAKE is instant (B on output at once)"] = px is not None and px.green() > 200
+    results["TAKE swapped live/cue"] = win.live == ("ndi", names["B"]) and \
+        win.cue == ("ndi", names["A"])
+    win.take()
+    px = centre(win.output._image)
+    results["TAKE toggles back to A"] = px is not None and px.red() > 200 and \
+        win.live == ("ndi", names["A"])
+    QTimer.singleShot(1500, step7)
+
+
+latency = {}
+
+
+def step7():
+    # Measure end-to-end delay: sender changes colour -> picture reaches output
+    win._set_transition(0)
+    latency["t0"] = time.perf_counter()
+    colours["CI Feed A"] = (255, 255, 255)
+    poll.start()
+
+
+def poll_output():
+    px = centre(win.output._image)
+    if px is not None and px.red() > 200 and px.green() > 200 and px.blue() > 200:
+        poll.stop()
+        ms = (time.perf_counter() - latency["t0"]) * 1000
+        print(f"END-TO-END LATENCY (sender -> output): {ms:.0f} ms")
+        results["latency under 250 ms"] = ms < 250
+        step8()
+    elif time.perf_counter() - latency["t0"] > 3:
+        poll.stop()
+        results["latency under 250 ms"] = False
+        step8()
+
+
+poll = QTimer()
+poll.setInterval(2)
+poll.timeout.connect(poll_output)
+
+
+def step8():
     win.thumb_action.setChecked(False)
     results["thumbnails switch off"] = all(c.preview is None for c in win.cards.values())
     win._off_air_and_close()
