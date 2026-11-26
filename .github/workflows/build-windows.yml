@@ -36,6 +36,12 @@ jobs:
           name: NDI-Live-Switcher-windows
           path: dist/NDI-Live-Switcher.exe
 
+      - name: Point the "latest" tag at this build
+        shell: bash
+        run: |
+          git tag -f latest
+          git push -f origin latest
+
       - name: Publish as latest release
         uses: softprops/action-gh-release@v2
         with:

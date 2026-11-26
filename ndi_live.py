@@ -1,8 +1,8 @@
 """
 NDI Live Switcher
 -----------------
-Discovers every NDI source on the local network, shows them as a grid of
-cards (machine name + source name) with a LIVE button under each.
+Discovers every NDI source on the local network and shows them as a grid of
+cards: a live thumbnail, the machine / source name and a LIVE button.
 
 Click LIVE  -> button turns red and that feed plays full screen on the
                selected output display (an external monitor by default).
@@ -10,33 +10,55 @@ Click again -> takes it off air and closes the output window.
 Only one source is live at a time; clicking another switches to it.
 Press Esc on the output window to close it.
 
+Hide        -> removes an unwanted input from the grid (and stops its
+               thumbnail, saving network bandwidth). Hidden inputs are
+               remembered between sessions and can be restored from the
+               "Hidden" menu in the top bar.
+
 Requires: NDI runtime/tools installed, plus `pip install -r requirements.txt`.
 """
 
 import sys
-import threading
+import time
 
 import numpy as np
 import NDIlib as ndi
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QImage, QPainter, QFont
+from PySide6.QtCore import QSettings, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QFont, QGuiApplication, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QMainWindow, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QPushButton, QScrollArea, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
-COLUMNS = 4
 REFRESH_MS = 2000
+THUMB_W, THUMB_H = 256, 144
+THUMB_FPS = 5
+CARD_W = THUMB_W + 20
+GRID_SPACING = 16
 
 BTN_IDLE = """
 QPushButton { background:#2b2f36; color:#e6e6e6; border:1px solid #444;
-              border-radius:6px; padding:10px; font-weight:bold; font-size:14px; }
+              border-radius:6px; padding:8px; font-weight:bold; font-size:14px; }
 QPushButton:hover { background:#3a3f48; }
 """
 BTN_LIVE = """
 QPushButton { background:#d11a2a; color:white; border:1px solid #ff4d5a;
-              border-radius:6px; padding:10px; font-weight:bold; font-size:14px; }
+              border-radius:6px; padding:8px; font-weight:bold; font-size:14px; }
 """
+BTN_HIDE = """
+QPushButton { background:transparent; color:#8a929c; border:1px solid #3a3f48;
+              border-radius:6px; padding:8px 10px; font-size:12px; }
+QPushButton:hover { color:white; border-color:#666; }
+"""
+
+
+def split_name(ndi_name: str):
+    """NDI names look like 'MACHINE (Source Name)'."""
+    if "(" in ndi_name and ndi_name.endswith(")"):
+        machine, src = ndi_name.split("(", 1)
+        return machine.strip(), src[:-1].strip()
+    return ndi_name, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -71,43 +93,42 @@ class DiscoveryThread(QThread):
 
 
 # --------------------------------------------------------------------------- #
-# NDI receiving
+# NDI receiving (used for both full-quality output and low-res thumbnails)
 # --------------------------------------------------------------------------- #
 class ReceiverThread(QThread):
     """Connects to one named NDI source and emits video frames as QImages."""
     frame_ready = Signal(QImage)
     status = Signal(str)
 
-    def __init__(self, source_name: str):
+    def __init__(self, source_name: str, preview: bool = False):
         super().__init__()
         self.source_name = source_name
+        self.preview = preview
         self._running = True
 
-    def _find_source(self):
-        finder = ndi.find_create_v2()
-        try:
-            for _ in range(10):  # up to ~10 s
-                if not self._running:
-                    return None, finder
-                ndi.find_wait_for_sources(finder, 1000)
-                for s in ndi.find_get_current_sources(finder):
-                    if s.ndi_name == self.source_name:
-                        return s, finder
-            return None, finder
-        except Exception:
-            return None, finder
+    def _find_source(self, finder):
+        while self._running:  # keep looking until found or stopped
+            ndi.find_wait_for_sources(finder, 1000)
+            for s in ndi.find_get_current_sources(finder):
+                if s.ndi_name == self.source_name:
+                    return s
+        return None
 
     def run(self):
-        self.status.emit(f"Connecting to {self.source_name}…")
-        source, finder = self._find_source()
+        self.status.emit("Connecting…")
+        finder = ndi.find_create_v2()
+        if finder is None:
+            self.status.emit("NDI error")
+            return
+        source = self._find_source(finder)
         if source is None:
             ndi.find_destroy(finder)
-            self.status.emit(f"Source not found: {self.source_name}")
             return
 
         desc = ndi.RecvCreateV3()
         desc.color_format = ndi.RECV_COLOR_FORMAT_BGRX_BGRA
-        desc.bandwidth = ndi.RECV_BANDWIDTH_HIGHEST
+        desc.bandwidth = (ndi.RECV_BANDWIDTH_LOWEST if self.preview
+                          else ndi.RECV_BANDWIDTH_HIGHEST)
         recv = ndi.recv_create_v3(desc)
         if recv is None:
             ndi.find_destroy(finder)
@@ -115,19 +136,34 @@ class ReceiverThread(QThread):
             return
 
         ndi.recv_connect(recv, source)
-        ndi.find_destroy(finder)  # source info has been copied into the receiver
-        self.status.emit("")
+        ndi.find_destroy(finder)
+        min_gap = 1.0 / THUMB_FPS if self.preview else 0.0
+        last_emit = 0.0
+        got_video = False
 
         try:
             while self._running:
                 t, v, a, m = ndi.recv_capture_v2(recv, 500)
                 if t == ndi.FRAME_TYPE_VIDEO:
+                    now = time.monotonic()
+                    if now - last_emit < min_gap:
+                        ndi.recv_free_video_v2(recv, v)
+                        continue
+                    last_emit = now
                     h, w = v.yres, v.xres
                     stride = v.line_stride_in_bytes
                     data = np.copy(v.data)
                     ndi.recv_free_video_v2(recv, v)
                     # BGRX bytes == QImage.Format_RGB32 on little-endian machines
-                    img = QImage(data.data, w, h, stride, QImage.Format_RGB32).copy()
+                    img = QImage(data.data, w, h, stride, QImage.Format_RGB32)
+                    if self.preview:
+                        img = img.scaled(THUMB_W, THUMB_H, Qt.KeepAspectRatio,
+                                         Qt.SmoothTransformation)
+                    else:
+                        img = img.copy()
+                    if not got_video:
+                        got_video = True
+                        self.status.emit("")
                     self.frame_ready.emit(img)
                 elif t == ndi.FRAME_TYPE_AUDIO:
                     ndi.recv_free_audio_v2(recv, a)
@@ -136,9 +172,10 @@ class ReceiverThread(QThread):
         finally:
             ndi.recv_destroy(recv)
 
-    def stop(self):
+    def stop(self, wait: bool = True):
         self._running = False
-        self.wait(2000)
+        if wait:
+            self.wait(2500)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,9 +215,8 @@ class OutputWindow(QWidget):
         if self._image is not None and not self._image.isNull():
             scaled = self._image.scaled(self.size(), Qt.KeepAspectRatio,
                                         Qt.SmoothTransformation)
-            x = (self.width() - scaled.width()) // 2
-            y = (self.height() - scaled.height()) // 2
-            p.drawImage(x, y, scaled)
+            p.drawImage((self.width() - scaled.width()) // 2,
+                        (self.height() - scaled.height()) // 2, scaled)
         elif self._message:
             p.setPen(Qt.gray)
             p.setFont(QFont("Arial", 24))
@@ -196,48 +232,92 @@ class OutputWindow(QWidget):
 
 
 # --------------------------------------------------------------------------- #
-# Source card
+# Source card: thumbnail + name + LIVE + Hide
 # --------------------------------------------------------------------------- #
 class SourceCard(QFrame):
     live_clicked = Signal(str)
+    hide_clicked = Signal(str)
 
     def __init__(self, ndi_name: str):
         super().__init__()
         self.ndi_name = ndi_name
-        self.setStyleSheet("QFrame { background:#1c1f24; border:1px solid #333;"
-                           " border-radius:10px; }")
-        self.setFixedSize(240, 150)
+        self.setObjectName("card")
+        self.setFixedWidth(CARD_W)
+        self._set_border(False)
 
-        # NDI names look like "MACHINE (Source Name)"
-        if "(" in ndi_name and ndi_name.endswith(")"):
-            machine, src = ndi_name.split("(", 1)
-            machine, src = machine.strip(), src[:-1].strip()
-        else:
-            machine, src = ndi_name, ""
+        self.thumb = QLabel("Connecting…")
+        self.thumb.setFixedSize(QSize(THUMB_W, THUMB_H))
+        self.thumb.setAlignment(Qt.AlignCenter)
+        self.thumb.setStyleSheet("background:black; color:#666; border:none;"
+                                 " border-radius:6px; font-size:12px;")
 
+        machine, src = split_name(ndi_name)
         m = QLabel(machine)
-        m.setStyleSheet("color:white; font-size:16px; font-weight:bold; border:none;")
-        m.setAlignment(Qt.AlignCenter)
+        m.setStyleSheet("color:white; font-size:15px; font-weight:bold; border:none;")
         m.setWordWrap(True)
-        s = QLabel(src)
+        s = QLabel(src or " ")
         s.setStyleSheet("color:#9aa3ad; font-size:12px; border:none;")
-        s.setAlignment(Qt.AlignCenter)
         s.setWordWrap(True)
+        self.setToolTip(ndi_name)
 
         self.button = QPushButton("LIVE")
         self.button.setCursor(Qt.PointingHandCursor)
         self.button.clicked.connect(lambda: self.live_clicked.emit(self.ndi_name))
-        self.set_live(False)
+
+        hide = QPushButton("Hide")
+        hide.setToolTip("Hide this input (restore it from the Hidden menu)")
+        hide.setCursor(Qt.PointingHandCursor)
+        hide.setStyleSheet(BTN_HIDE)
+        hide.clicked.connect(lambda: self.hide_clicked.emit(self.ndi_name))
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.button, 1)
+        buttons.addWidget(hide)
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+        lay.addWidget(self.thumb)
         lay.addWidget(m)
         lay.addWidget(s)
-        lay.addStretch()
-        lay.addWidget(self.button)
+        lay.addLayout(buttons)
+        self.set_live(False)
+
+        # low-bandwidth thumbnail feed
+        self.preview = ReceiverThread(ndi_name, preview=True)
+        self.preview.frame_ready.connect(self._on_thumb)
+        self.preview.status.connect(self._on_status)
+        self.preview.start()
+
+    def _set_border(self, live: bool):
+        colour = "#d11a2a" if live else "#333"
+        self.setStyleSheet(f"QFrame#card {{ background:#1c1f24; border:2px solid {colour};"
+                           " border-radius:10px; }")
+
+    def _on_thumb(self, img: QImage):
+        self.thumb.setPixmap(QPixmap.fromImage(img))
+
+    def _on_status(self, text: str):
+        if text:
+            self.thumb.clear()
+            self.thumb.setText(text)
 
     def set_live(self, live: bool):
         self.button.setStyleSheet(BTN_LIVE if live else BTN_IDLE)
         self.button.setText("● LIVE" if live else "LIVE")
+        self._set_border(live)
+
+    def shutdown(self, graveyard: set):
+        """Stop the thumbnail thread without blocking the UI."""
+        t = self.preview
+        try:
+            t.frame_ready.disconnect()
+            t.status.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        graveyard.add(t)
+        t.finished.connect(lambda: graveyard.discard(t))
+        t.stop(wait=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -247,55 +327,74 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("NDI Live Switcher")
-        self.resize(1100, 700)
+        self.resize(1200, 760)
         self.setStyleSheet("QMainWindow, QWidget#root { background:#121417; }"
-                           " QLabel { color:#e6e6e6; }")
+                           " QLabel { color:#e6e6e6; }"
+                           " QToolButton { color:#e6e6e6; background:#2b2f36;"
+                           "   border:1px solid #444; border-radius:6px; padding:5px 10px; }"
+                           " QMenu { background:#1c1f24; color:#e6e6e6; }"
+                           " QMenu::item:selected { background:#3a3f48; }")
 
+        self.settings = QSettings("NDI Live Switcher", "NDI Live Switcher")
+        self.hidden: set[str] = set(self.settings.value("hidden", [], type=list) or [])
+        self.online: list[str] = []
         self.cards: dict[str, SourceCard] = {}
+        self._graveyard: set = set()  # threads that are shutting down
         self.live_source: str | None = None
         self.receiver: ReceiverThread | None = None
         self.output = OutputWindow()
-        self.output.closed.connect(self._on_output_closed)
+        self.output.closed.connect(self._take_off_air)
 
         root = QWidget(objectName="root")
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
 
-        # Top bar
+        # ---- top bar ----
         bar = QHBoxLayout()
         title = QLabel("NDI Sources")
         title.setStyleSheet("font-size:22px; font-weight:bold;")
         self.count_label = QLabel("Searching…")
         self.count_label.setStyleSheet("color:#9aa3ad;")
+
+        self.hidden_btn = QToolButton()
+        self.hidden_btn.setPopupMode(QToolButton.InstantPopup)
+        self.hidden_menu = QMenu(self)
+        self.hidden_menu.aboutToShow.connect(self._build_hidden_menu)
+        self.hidden_btn.setMenu(self.hidden_menu)
+
         self.screen_combo = QComboBox()
         self.screen_combo.setMinimumWidth(260)
         self._populate_screens()
-        QGuiApplication.instance().screenAdded.connect(lambda _: self._populate_screens())
-        QGuiApplication.instance().screenRemoved.connect(lambda _: self._populate_screens())
+        app = QGuiApplication.instance()
+        app.screenAdded.connect(lambda _: self._populate_screens())
+        app.screenRemoved.connect(lambda _: self._populate_screens())
 
         bar.addWidget(title)
         bar.addSpacing(12)
         bar.addWidget(self.count_label)
         bar.addStretch()
+        bar.addWidget(self.hidden_btn)
+        bar.addSpacing(12)
         bar.addWidget(QLabel("Output display:"))
         bar.addWidget(self.screen_combo)
         outer.addLayout(bar)
 
-        # Grid
+        # ---- grid ----
         self.grid_host = QWidget()
         self.grid_host.setStyleSheet("background:#121417;")
         self.grid = QGridLayout(self.grid_host)
-        self.grid.setSpacing(16)
+        self.grid.setSpacing(GRID_SPACING)
         self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.grid_host)
-        scroll.setStyleSheet("QScrollArea { border:none; }")
-        outer.addWidget(scroll)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self.grid_host)
+        self.scroll.setStyleSheet("QScrollArea { border:none; }")
+        outer.addWidget(self.scroll)
 
-        # Discovery
+        self._update_hidden_button()
+
         self.discovery = DiscoveryThread()
-        self.discovery.sources_changed.connect(self._update_sources)
+        self.discovery.sources_changed.connect(self._on_sources)
         self.discovery.start()
 
     # ---- screens ----
@@ -308,7 +407,6 @@ class MainWindow(QMainWindow):
             g = sc.geometry()
             tag = " (main)" if sc is primary else ""
             self.screen_combo.addItem(f"{i + 1}: {sc.name()} {g.width()}x{g.height()}{tag}", i)
-        # default to first non-primary screen (the external display)
         idx = next((i for i, sc in enumerate(screens) if sc is not primary), 0)
         if current is not None and current < len(screens):
             idx = current
@@ -319,30 +417,97 @@ class MainWindow(QMainWindow):
         i = self.screen_combo.currentData() or 0
         return screens[i] if i < len(screens) else QGuiApplication.primaryScreen()
 
-    # ---- sources ----
-    def _update_sources(self, names: list):
+    # ---- sources / grid ----
+    def _on_sources(self, names: list):
+        self.online = names
+        self._sync_cards()
+
+    def _sync_cards(self):
+        wanted = {n for n in self.online if n not in self.hidden}
+        if self.live_source:
+            wanted.add(self.live_source)  # never drop the live card
         for n in list(self.cards):
-            if n not in names and n != self.live_source:
-                self.cards.pop(n).deleteLater()
-        for n in names:
+            if n not in wanted:
+                card = self.cards.pop(n)
+                card.shutdown(self._graveyard)
+                self.grid.removeWidget(card)
+                card.deleteLater()
+        for n in wanted:
             if n not in self.cards:
                 card = SourceCard(n)
                 card.live_clicked.connect(self._on_live_clicked)
+                card.hide_clicked.connect(self._hide_source)
+                card.set_live(n == self.live_source)
                 self.cards[n] = card
-        # re-lay out in sorted order
+        self._relayout()
+
+        shown = len(self.cards)
+        hidden_online = sum(1 for n in self.online if n in self.hidden)
+        if not self.online:
+            self.count_label.setText("No NDI sources found yet…")
+        else:
+            txt = f"{shown} source{'s' if shown != 1 else ''} shown"
+            if hidden_online:
+                txt += f" · {hidden_online} hidden"
+            self.count_label.setText(txt)
+        self._update_hidden_button()
+
+    def _relayout(self):
+        for card in self.cards.values():
+            self.grid.removeWidget(card)
+        avail = self.scroll.viewport().width() - 20
+        cols = max(1, avail // (CARD_W + GRID_SPACING))
         for i, n in enumerate(sorted(self.cards)):
-            self.grid.addWidget(self.cards[n], i // COLUMNS, i % COLUMNS)
-        count = len(names)
-        self.count_label.setText(f"{count} source{'s' if count != 1 else ''} found"
-                                 if count else "No NDI sources found yet…")
+            self.grid.addWidget(self.cards[n], i // cols, i % cols)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._relayout()
+
+    # ---- hiding ----
+    def _hide_source(self, name: str):
+        if name == self.live_source:
+            self._take_off_air()
+            self.output.close()
+        self.hidden.add(name)
+        self._save_hidden()
+        self._sync_cards()
+
+    def _unhide(self, name: str):
+        self.hidden.discard(name)
+        self._save_hidden()
+        self._sync_cards()
+
+    def _unhide_all(self):
+        self.hidden.clear()
+        self._save_hidden()
+        self._sync_cards()
+
+    def _save_hidden(self):
+        self.settings.setValue("hidden", sorted(self.hidden))
+
+    def _update_hidden_button(self):
+        n = len(self.hidden)
+        self.hidden_btn.setText(f"Hidden ({n}) ▾")
+        self.hidden_btn.setEnabled(n > 0)
+
+    def _build_hidden_menu(self):
+        self.hidden_menu.clear()
+        for name in sorted(self.hidden):
+            label = name if name in self.online else f"{name}   (offline)"
+            act = self.hidden_menu.addAction(f"Show  {label}")
+            act.triggered.connect(lambda _=False, n=name: self._unhide(n))
+        if self.hidden:
+            self.hidden_menu.addSeparator()
+            self.hidden_menu.addAction("Show all").triggered.connect(self._unhide_all)
 
     # ---- live switching ----
     def _on_live_clicked(self, name: str):
         if name == self.live_source:
             self._take_off_air()
             self.output.close()
-            return
-        self._go_live(name)
+        else:
+            self._go_live(name)
 
     def _go_live(self, name: str):
         self._stop_receiver()
@@ -362,23 +527,31 @@ class MainWindow(QMainWindow):
 
     def _take_off_air(self):
         self._stop_receiver()
-        if self.live_source in self.cards:
-            self.cards[self.live_source].set_live(False)
+        was = self.live_source
         self.live_source = None
+        if was in self.cards:
+            self.cards[was].set_live(False)
+        if was and (was in self.hidden or was not in self.online):
+            self._sync_cards()
 
     def _stop_receiver(self):
         if self.receiver is not None:
-            self.receiver.frame_ready.disconnect()
+            try:
+                self.receiver.frame_ready.disconnect()
+                self.receiver.status.disconnect()
+            except (RuntimeError, TypeError):
+                pass
             self.receiver.stop()
             self.receiver = None
 
-    def _on_output_closed(self):
-        self._take_off_air()
-
     def closeEvent(self, e):
-        self._take_off_air()
+        self._stop_receiver()
         self.output.close()
+        for card in self.cards.values():
+            card.shutdown(self._graveyard)
         self.discovery.stop()
+        for t in list(self._graveyard):
+            t.wait(2500)
         super().closeEvent(e)
 
 

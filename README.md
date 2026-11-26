@@ -16,7 +16,8 @@ When you click it, the button turns red and that feed plays full screen on your 
 
 ## Use
 - Sources show up on their own within a couple of seconds, and the grid refreshes as devices join or leave.
-- Each card shows the machine name, with the NDI source name under it.
+- Each card shows a live thumbnail (low-bandwidth, about 5 fps), the machine name and the NDI source name.
+- **Hide** removes an input you don't want from the grid and stops its thumbnail. Hidden inputs stay hidden the next time you open the app. You can bring them back from the **Hidden (n) ▾** menu in the top bar, one at a time or with **Show all**.
 - **LIVE** turns the button red and opens that feed full screen on the display picked under *Output display*. The first external monitor is picked by default.
 - If you click a different source's LIVE, the output switches to it. Only one source is live at a time.
 - If you click the red button again, or press **Esc** on the output, the feed goes off air.
