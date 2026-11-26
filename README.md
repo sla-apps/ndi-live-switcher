@@ -22,6 +22,15 @@ When you click it, the button turns red and that feed plays full screen on your 
 - If you click a different source's LIVE, the output switches to it. Only one source is live at a time.
 - If you click the red button again, or press **Esc** on the output, the feed goes off air.
 
+## Cue and Take
+- **CUE** (it turns green) loads an input into the **CUED** monitor on the right. The input connects in the background, ready to go.
+- **TAKE**, or the **Space bar**, swaps the live and cued inputs straight away. Press it again to swap back.
+- The panel on the right always shows **LIVE** at the top, then the TAKE button and transition choice, then **CUED**. The grid of inputs scrolls on its own.
+- **LIVE** on a card still sends that input straight to air.
+
+## Latency
+The app always shows the newest frame and skips any that arrive late, so delay doesn't build up. In the automated test, a change on an NDI source reached the output in about 65 ms (2 frames).
+
 ## Switching
 When you click LIVE on another input, the current picture stays on screen until the new input is ready, so there's no black gap. It then cuts or fades to the new input. Choose **Output ▸ Transition**: Cut, or a fade of 0.25 s, 0.5 s (the default) or 1 s.
 
