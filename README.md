@@ -22,6 +22,15 @@ When you click it, the button turns red and that feed plays full screen on your 
 - If you click a different source's LIVE, the output switches to it. Only one source is live at a time.
 - If you click the red button again, or press **Esc** on the output, the feed goes off air.
 
+## Switching
+When you click LIVE on another input, the current picture stays on screen until the new input is ready, so there's no black gap. It then cuts or fades to the new input. Choose **Output ▸ Transition**: Cut, or a fade of 0.25 s, 0.5 s (the default) or 1 s.
+
+## Holding images
+Use **＋ Holding Image** (or File ▸ Add Holding Image, Ctrl+I) to add one or more images, such as a logo or a "we'll be right back" slide. Each image gets its own card with a LIVE button. **Ctrl+H** jumps straight to the first holding image.
+
+## Finding sources
+**⟳ Refresh** (F5) searches the network again. **View ▸ NDI Network Settings** lets you add the IP addresses of devices on other subnets or VLANs, and NDI group names. If your network uses an NDI Discovery Server, set it up in NDI Access Manager; the app follows that setting too.
+
 ## Menus
 - **File:** Open Settings… (Ctrl+O), Save Settings… (Ctrl+S), Reset All Framing, Quit (Ctrl+Q)
 - **View:** Show Thumbnails on/off (Ctrl+T), Hidden Inputs
