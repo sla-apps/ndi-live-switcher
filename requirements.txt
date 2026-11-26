@@ -1,0 +1,3 @@
+ndi-python>=5.1
+PySide6>=6.5
+numpy
